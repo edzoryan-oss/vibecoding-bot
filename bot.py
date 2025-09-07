@@ -4,64 +4,100 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 import openai
 
-# 🔑 Ключі з Environment Variables
+# 🔑 Keys
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai.api_key = OPENAI_API_KEY
 
 logging.basicConfig(level=logging.INFO)
 
-# 🧠 СИСТЕМНИЙ ПРОМПТ: місія чату + стиль
 SYSTEM_PROMPT = (
     "Ти — офіційний помічник українського чату Vibe-Coding. "
-    "Мета спільноти: новий підхід до створення коду, де ШІ (LLM) пише код, а люди формулюють ідеї. "
-    "У чаті ділимось досвідом, ідеями, кодом, допомагаємо одне одному. Україна! "
-    "Ми формуємо щільне комʼюніті, яке використовує ШІ для скриптів, програм, відео, аудіо та інших продуктів. "
-    "Вайбкодинг зараз для декого виглядає як експеримент, але ми віримо, що це новий стандарт. "
-    "Є сайт спільноти: vibe-coding.com.ua — точка збору професійних вайбкодерів, проєктів і роботи. "
-    "Твій стиль: дуже ввічливий, підтримуючий, доброзичливий, лаконічний і по суті. "
-    "Дозволена легка іронія щодо типових 'болей' програмістів (без образ і токсичності). "
-    "Комунікуй українською. Якщо користувач звертається іншою мовою — ввічливо запропонуй перейти на українську. "
-    "Безпека і етика: не допускай мови ненависті, дискримінації, принижень за національністю/етнічністю/статтю тощо. "
-    "Недопустимі заклики до насильства, виправдання агресії або пропаганда війни. "
-    "Якщо запит порушує правила — ввічливо відмовляй і коротко пояснюй причину, пропонуй безпечну альтернативу. "
-    "Завжди допомагай з інженерією підказок, прикладами коду, налагодженням, ідеями для проєктів."
+    "Відповідай українською, чемно і по суті, з легкою іронією про типові болі програмістів (без токсичності). "
+    "Не допускай мови ненависті чи закликів до насильства. "
+    "Якщо просять картинку — приймай короткий опис і генеруй її."
 )
 
-# 🛡️ Дуже проста 'модерація' на боці бота (можна розширити)
-BLOCK_LIST = [
-    # без детальних переліків — лише загальні маркери, щоб не зберігати образливі слова у коді
-    "заклик до насильства", "знищити народ", "геноцид", "ненавиджу націю"
-]
-def violates_rules(text: str) -> bool:
-    tl = text.lower()
-    return any(key in tl for key in BLOCK_LIST)
+HELP_TEXT = (
+    "👋 Як користуватись ботом:\n"
+    "• Звертайся тегом @імʼя_бота або починай повідомлення зі слова «бот».\n"
+    "• Щоб намалювати: /img <опис> або «згенеруй картинку <опис>», «намалюй <опис>».\n"
+    "Приклад: /img лого у стилі мінімалізм, синьо-жовті кольори.\n"
+)
+
+RULES_TEXT = (
+    "Правила Vibe-Coding: повага, конструктив, українська мова. "
+    "Без мови ненависті та пропаганди агресії. Допомагаємо одне одному, ділимось ідеями та кодом."
+)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привіт! Я GPT-бот Vibe-Coding. Пиши з тегом @vibecoding_bot або починай повідомлення зі слова «бот» 🙂"
+        "Привіт! Я GPT-бот Vibe-Coding. Напиши «бот ...» або тегни @мене. Для картинок: /img <опис>."
     )
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT)
+
+async def rules_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(RULES_TEXT)
+
+async def generate_image_and_reply(update: Update, prompt: str):
+    try:
+        # OpenAI Images API (для openai==0.28 — Image.create)
+        img_resp = openai.Image.create(
+            model="gpt-image-1",
+            prompt=prompt,
+            size="1024x1024"
+        )
+        url = img_resp["data"][0]["url"]
+        await update.message.reply_photo(url, caption="Готово ✅")
+    except Exception as e:
+        logging.exception("Image gen error: %s", e)
+        await update.message.reply_text("Не вийшло створити зображення 😕 Спробуй переформулювати опис.")
+
+async def img_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    prompt = " ".join(context.args).strip()
+    if not prompt:
+        await update.message.reply_text("Напиши опис: /img <що намалювати>")
+        return
+    await generate_image_and_reply(update, prompt)
+
+def is_image_request(text: str) -> bool:
+    t = text.lower().strip()
+    return t.startswith("згенеруй картинку") or t.startswith("намалюй") or t.startswith("створи картинку")
 
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
     user_message = update.message.text.strip()
 
-    # ✅ Тригер: тег або початок з "бот"
-    mentioned = bool(update.message.entities and any(e.type == "mention" for e in update.message.entities))
+    # Тригер: тег саме нашого бота або початок "бот"
+    bot_username = (context.bot.username or "").lower()
+    entities = update.message.entities or []
+    mentioned_bot = any(
+        e.type == "mention" and
+        user_message[e.offset:e.offset + e.length].lower() == f"@{bot_username}"
+        for e in entities
+    )
     starts_with_word = user_message.lower().startswith("бот")
 
-    if not (mentioned or starts_with_word):
+    if not (mentioned_bot or starts_with_word or is_image_request(user_message)):
         return
 
-    # 🛡️ Перевірка простих порушень правил
-    if violates_rules(user_message):
-        await update.message.reply_text(
-            "Я за безпечну та поважну комунікацію. У чаті заборонена мова ненависті, "
-            "дискримінація та заклики до насильства. Сформулюй, будь ласка, по-іншому 🙏"
-        )
+    # Якщо просили картинку — генеруємо і виходимо
+    if is_image_request(user_message):
+        # вирізаємо ключове слово і лишаємо опис
+        for kw in ["згенеруй картинку", "намалюй", "створи картинку"]:
+            if user_message.lower().startswith(kw):
+                prompt = user_message[len(kw):].strip(" :,-")
+                break
+        if not prompt:
+            await update.message.reply_text("Додай опис до запиту на картинку 🙂")
+            return
+        await generate_image_and_reply(update, prompt)
         return
 
+    # Інакше — звичайна текстова відповідь
     try:
         completion = openai.ChatCompletion.create(
             model="gpt-4o-mini",
@@ -73,17 +109,22 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         reply = completion["choices"][0]["message"]["content"].strip()
         await update.message.reply_text(reply)
+        # (необов’язково) залогувати модель і токени
+        usage = completion.get("usage", {})
+        logging.info("OpenAI model=%s prompt=%s completion=%s",
+                     completion.get("model"), usage.get("prompt_tokens"), usage.get("completion_tokens"))
     except Exception as e:
         logging.exception("OpenAI error: %s", e)
-        await update.message.reply_text(
-            "Вибач, тимчасова помилка відповіді ШІ. Спробуй ще раз за хвилинку 🙏"
-        )
+        await update.message.reply_text("Вибач, сталася помилка на стороні ШІ. Спробуй ще раз 🙏")
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("rules", rules_cmd))
+    app.add_handler(CommandHandler("img", img_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
