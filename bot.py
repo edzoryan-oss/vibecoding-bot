@@ -24,10 +24,10 @@ logger = logging.getLogger(__name__)
 
 # ==== КОНФІГ ОБМЕЖЕНЬ ====
 # скільки зображень на день може згенерувати кожен користувач (0 або менше = без денного ліміту)
-IMG_LIMIT_PER_DAY = int(os.getenv("IMG_LIMIT_PER_DAY", "3"))
+IMG_LIMIT_PER_DAY = int(os.getenv("IMG_LIMIT_PER_DAY", "2"))
 
 # кулдаун між генераціями на користувача (секунди). за замовчуванням 5 хв = 300с
-IMG_COOLDOWN_SEC = int(os.getenv("IMG_COOLDOWN_SEC", "300"))
+IMG_COOLDOWN_SEC = int(os.getenv("IMG_COOLDOWN_SEC", "20"))
 
 # заборонені слова/теми
 BANNED_WORDS = [
@@ -265,3 +265,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
