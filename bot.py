@@ -2,6 +2,7 @@ import os
 import io
 import logging
 import re
+import requests
 
 from telegram import Update
 from telegram.ext import (
@@ -69,8 +70,16 @@ async def rules_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ====== ГЕНЕРАЦІЯ ЗОБРАЖЕНЬ =================================================
 
+def _download_to_bytes(url: str) -> bytes:
+    # Надійне завантаження з повтором
+    for _ in range(2):
+        r = requests.get(url, timeout=30)
+        if r.status_code == 200:
+            return r.content
+    raise RuntimeError(f"HTTP {r.status_code} while downloading image")
+
 async def generate_image_and_reply(update: Update, prompt: str):
-    """Генеруємо картинку і відправляємо її як фото через URL (для openai==0.28)."""
+    """Генеруємо картинку через URL (openai==0.28) і надсилаємо її як файл."""
     try:
         img_resp = openai.Image.create(
             model="gpt-image-1",
@@ -79,13 +88,19 @@ async def generate_image_and_reply(update: Update, prompt: str):
             n=1
         )
         url = img_resp["data"][0]["url"]
-        await update.message.reply_photo(url, caption="Готово ✅")
+
+        # Скачуємо в байти і шлемо як фото — стабільніше, ніж давати Telegram URL
+        img_bytes = _download_to_bytes(url)
+        bio = io.BytesIO(img_bytes)
+        bio.name = "image.png"
+        bio.seek(0)
+        await update.message.reply_photo(bio, caption="Готово ✅")
 
         logging.info("Image OK | prompt='%s' | model=%s", prompt, img_resp.get("model", "gpt-image-1"))
     except Exception as e:
         logging.exception("Image gen error: %s", e)
         await update.message.reply_text(
-            "Не вийшло створити зображення 😕 Спробуй коротший опис або додай «мультяшний стиль»."
+            "Не вийшло створити зображення 😕 Спробуй інший опис (додай «мультяшний стиль» або «ілюстрація»)."
         )
 
 async def img_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
