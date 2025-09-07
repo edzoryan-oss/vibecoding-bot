@@ -34,7 +34,7 @@ HELP_TEXT = (
     "• Звертайся тегом @імʼя_бота або починай повідомлення зі слова «бот».\n"
     "• Створити картинку: /img <опис>\n"
     "  або фрази: «згенеруй картинку …», «намалюй …», «створи картинку …».\n"
-    "Приклад: /img мінімалістичне лого у синьо-жовтих кольорах."
+    "Приклад: /img кіт у мультяшному стилі, яскраві кольори."
 )
 
 RULES_TEXT = (
@@ -54,6 +54,59 @@ def is_image_request(text: str) -> bool:
     t = (text or "").lower().strip()
     return any(t.startswith(k) for k in IMAGE_KEYWORDS)
 
+def _download_to_bytes(url: str) -> bytes:
+    for _ in range(2):
+        r = requests.get(url, timeout=30)
+        if r.status_code == 200:
+            return r.content
+    raise RuntimeError(f"HTTP {r.status_code} while downloading image")
+
+# ====== ГЕНЕРАЦІЯ ЗОБРАЖЕНЬ =================================================
+
+def _image_create_url_first(prompt: str):
+    """
+    Спочатку пробуємо gpt-image-1 (якщо доступна),
+    якщо падає — пробуємо dall-e-3. Повертаємо URL.
+    """
+    # 1) gpt-image-1
+    try:
+        resp = openai.Image.create(
+            model="gpt-image-1",
+            prompt=prompt,
+            size="1024x1024",
+            n=1,
+        )
+        return resp["data"][0]["url"], resp.get("model", "gpt-image-1")
+    except Exception as e:
+        logging.warning("gpt-image-1 failed: %s — trying dall-e-3", e)
+
+    # 2) dall-e-3 (стабільно працює з openai==0.28)
+    resp = openai.Image.create(
+        model="dall-e-3",
+        prompt=prompt,
+        size="1024x1024",
+        n=1,
+    )
+    return resp["data"][0]["url"], resp.get("model", "dall-e-3")
+
+async def generate_image_and_reply(update: Update, prompt: str):
+    """Генеруємо картинку, качаємо байти з URL і шлемо як файл."""
+    try:
+        url, used_model = _image_create_url_first(prompt)
+        img_bytes = _download_to_bytes(url)
+
+        bio = io.BytesIO(img_bytes)
+        bio.name = "image.png"
+        bio.seek(0)
+        await update.message.reply_photo(bio, caption="Готово ✅")
+        logging.info("Image OK | model=%s | prompt='%s'", used_model, prompt)
+
+    except Exception as e:
+        logging.exception("Image gen error: %s", e)
+        await update.message.reply_text(
+            "Не вийшло створити зображення 😕 Спробуй інакший опис (додай «мультяшний стиль» або «ілюстрація»)."
+        )
+
 # ====== КОМАНДИ =============================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -67,41 +120,6 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def rules_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(RULES_TEXT)
-
-# ====== ГЕНЕРАЦІЯ ЗОБРАЖЕНЬ =================================================
-
-def _download_to_bytes(url: str) -> bytes:
-    # Надійне завантаження з повтором
-    for _ in range(2):
-        r = requests.get(url, timeout=30)
-        if r.status_code == 200:
-            return r.content
-    raise RuntimeError(f"HTTP {r.status_code} while downloading image")
-
-async def generate_image_and_reply(update: Update, prompt: str):
-    """Генеруємо картинку через URL (openai==0.28) і надсилаємо її як файл."""
-    try:
-        img_resp = openai.Image.create(
-            model="gpt-image-1",
-            prompt=prompt,
-            size="1024x1024",
-            n=1
-        )
-        url = img_resp["data"][0]["url"]
-
-        # Скачуємо в байти і шлемо як фото — стабільніше, ніж давати Telegram URL
-        img_bytes = _download_to_bytes(url)
-        bio = io.BytesIO(img_bytes)
-        bio.name = "image.png"
-        bio.seek(0)
-        await update.message.reply_photo(bio, caption="Готово ✅")
-
-        logging.info("Image OK | prompt='%s' | model=%s", prompt, img_resp.get("model", "gpt-image-1"))
-    except Exception as e:
-        logging.exception("Image gen error: %s", e)
-        await update.message.reply_text(
-            "Не вийшло створити зображення 😕 Спробуй інший опис (додай «мультяшний стиль» або «ілюстрація»)."
-        )
 
 async def img_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = " ".join(context.args).strip()
