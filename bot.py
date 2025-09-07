@@ -1,7 +1,7 @@
 import os
 import io
-import logging
 import re
+import logging
 import requests
 
 from telegram import Update
@@ -43,30 +43,37 @@ RULES_TEXT = (
     "Ділимось ідеями, кодом і допомагаємо одне одному. Слава Україні! 🇺🇦"
 )
 
-# ====== ДОПОМІЖНІ ФУНКЦІЇ ===================================================
-
-IMAGE_KEYWORDS = (
-    "згенеруй картинку", "намалюй", "створи картинку", "генеруй картинку",
-    "створи зображення", "згенеруй зображення"
+# ====== РОЗПІЗНАВАННЯ ЗАПИТІВ НА КАРТИНКИ ==================================
+IMAGE_PATTERNS = (
+    r"\bзгенеруй\s+(картинку|зображення|фото)\b",
+    r"\bствори\s+(картинку|зображення|фото|арт)\b",
+    r"\bнамалюй\b",
+    r"^/img\b"
 )
 
 def is_image_request(text: str) -> bool:
     t = (text or "").lower().strip()
-    return any(t.startswith(k) for k in IMAGE_KEYWORDS)
+    return any(re.search(p, t) for p in IMAGE_PATTERNS)
 
+def extract_image_prompt(text: str) -> str:
+    """Вирізає службові слова та повертає чистий опис запиту на зображення."""
+    t = text.strip()
+    t = re.sub(r"^/img\s*", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"^(згенеруй|створи)\s+(картинку|зображення|фото)\s*[:,\-–]?\s*", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"^намалюй\s*[:,\-–]?\s*", "", t, flags=re.IGNORECASE)
+    return t.strip()
+
+# ====== ДОПОМОЖНІ ФУНКЦІЇ ДЛЯ ЗОБРАЖЕНЬ =====================================
 def _download_to_bytes(url: str) -> bytes:
-    for _ in range(2):
-        r = requests.get(url, timeout=30)
-        if r.status_code == 200:
-            return r.content
-    raise RuntimeError(f"HTTP {r.status_code} while downloading image")
-
-# ====== ГЕНЕРАЦІЯ ЗОБРАЖЕНЬ =================================================
+    """Скачує картинку за URL у байти (надійніше, ніж кидати URL у Telegram)."""
+    r = requests.get(url, timeout=45)
+    r.raise_for_status()
+    return r.content
 
 def _image_create_url_first(prompt: str):
     """
-    Спочатку пробуємо gpt-image-1 (якщо доступна),
-    якщо падає — пробуємо dall-e-3. Повертаємо URL.
+    Пробуємо згенерувати через gpt-image-1; якщо недоступно — падаємо на dall-e-3.
+    Повертаємо (url, model_name).
     """
     # 1) gpt-image-1
     try:
@@ -80,7 +87,7 @@ def _image_create_url_first(prompt: str):
     except Exception as e:
         logging.warning("gpt-image-1 failed: %s — trying dall-e-3", e)
 
-    # 2) dall-e-3 (стабільно працює з openai==0.28)
+    # 2) dall-e-3 (стабільно працює на openai==0.28)
     resp = openai.Image.create(
         model="dall-e-3",
         prompt=prompt,
@@ -90,7 +97,7 @@ def _image_create_url_first(prompt: str):
     return resp["data"][0]["url"], resp.get("model", "dall-e-3")
 
 async def generate_image_and_reply(update: Update, prompt: str):
-    """Генеруємо картинку, качаємо байти з URL і шлемо як файл."""
+    """Генеруємо зображення, качаємо байти і відправляємо як файл."""
     try:
         url, used_model = _image_create_url_first(prompt)
         img_bytes = _download_to_bytes(url)
@@ -104,11 +111,10 @@ async def generate_image_and_reply(update: Update, prompt: str):
     except Exception as e:
         logging.exception("Image gen error: %s", e)
         await update.message.reply_text(
-            "Не вийшло створити зображення 😕 Спробуй інакший опис (додай «мультяшний стиль» або «ілюстрація»)."
+            "Не вийшло створити зображення 😕 Спробуй інший опис (додай «мультяшний стиль» або «ілюстрація»)."
         )
 
 # ====== КОМАНДИ =============================================================
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привіт! Я GPT-бот Vibe-Coding. Напиши «бот …» або тегни @мене. "
@@ -128,14 +134,22 @@ async def img_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await generate_image_and_reply(update, prompt)
 
-# ====== ЧАТ-ЛОГІКА ==========================================================
-
+# ====== ОСНОВНА ЧАТ-ЛОГІКА ==================================================
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
     user_message = update.message.text.strip()
 
-    # Тригер: тег саме нашого бота або початок зі слова "бот"
+    # Якщо це запит на картинку — відповідаємо навіть без тригера "бот"
+    if is_image_request(user_message):
+        prompt = extract_image_prompt(user_message)
+        if not prompt:
+            await update.message.reply_text("Додай опис до запиту на зображення 🙂")
+            return
+        await generate_image_and_reply(update, prompt)
+        return
+
+    # Інакше — тригер по тегу або по слову "бот" на початку
     bot_username = (context.bot.username or "").lower()
     entities = update.message.entities or []
     mentioned_bot = any(
@@ -144,22 +158,6 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for e in entities
     )
     starts_with_word = user_message.lower().startswith("бот")
-
-    # Якщо це запит на картинку — навіть без тригера відповідаємо
-    if is_image_request(user_message):
-        lower = user_message.lower()
-        for kw in IMAGE_KEYWORDS:
-            if lower.startswith(kw):
-                prompt = user_message[len(kw):].strip(" :,-")
-                break
-        else:
-            prompt = user_message
-        if not prompt:
-            await update.message.reply_text("Додай опис до запиту на зображення 🙂")
-            return
-        await generate_image_and_reply(update, prompt)
-        return
-
     if not (mentioned_bot or starts_with_word):
         return
 
@@ -183,13 +181,11 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.exception("OpenAI error: %s", e)
         await update.message.reply_text("Вибач, сталася тимчасова помилка на стороні ШІ. Спробуй ще раз 🙏")
 
-# ====== ОБРОБКА ПОМИЛОК ====================================================
-
+# ====== ОБРОБКА ПОМИЛОК =====================================================
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logging.exception("Bot error: %s", context.error)
 
-# ====== ЗАПУСК ==============================================================
-
+# ====== ЗАПУСК ==============================================================-
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
