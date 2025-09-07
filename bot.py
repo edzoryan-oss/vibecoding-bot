@@ -3,6 +3,7 @@ import io
 import re
 import logging
 import requests
+from collections import defaultdict, deque
 
 from telegram import Update
 from telegram.ext import (
@@ -20,6 +21,20 @@ openai.api_key = OPENAI_API_KEY
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ==== ПАМ'ЯТЬ (в RAM) ====
+# Для кожного chat_id зберігаємо deque з останніх N повідомлень (user/assistant).
+MAX_TURNS = int(os.getenv("MAX_TURNS", "12"))  # по черзі: user, assistant, ...
+CHAT_MEMORY: dict[int, deque] = defaultdict(lambda: deque(maxlen=MAX_TURNS * 2))
+
+def remember(chat_id: int, role: str, content: str):
+    CHAT_MEMORY[chat_id].append({"role": role, "content": content})
+
+def get_memory(chat_id: int):
+    return list(CHAT_MEMORY[chat_id])
+
+def clear_memory(chat_id: int):
+    CHAT_MEMORY[chat_id].clear()
+
 # ==== СИСТЕМНИЙ ПРОМПТ (жорстко фіксує роль) ====
 SYSTEM_PROMPT = (
     "Ти — офіційний асистент української спільноти Vibe-Coding (Telegram-чат). "
@@ -28,7 +43,7 @@ SYSTEM_PROMPT = (
     "Роль бота: 1) відповідати українською; 2) допомагати з ідеями/кодом; "
     "3) підтримувати дружній, професійний тон; 4) за запитом генерувати ілюстрації через API. "
     "Стиль: ввічливо, коротко, по суті. Дозволена легка, доброзичлива іронія над "
-    "типовими болями програмістів (\"працює на моїй машині\", дедлайни, баги), без токсичності чи принижень. "
+    "типовими болями програмістів (\"працює на моїй машині\", дедлайни, баги), без токсичності. "
     "Заборонені мова ненависті, дискримінація, заклики до насильства. "
     "У групових чатах відповідай тільки коли звертаються тегом або зі слова «бот», а також на /img та /imgtest. "
     "Про спільноту: ділимось досвідом, ідеями, кодом і допомагаємо одне одному. "
@@ -42,23 +57,24 @@ HELP_TEXT = (
     "• /about — хто я і навіщо\n"
     "• /img <опис> — згенерувати ілюстрацію (напр.: /img кіт у мультяшному стилі)\n"
     "• /imgtest — тест зображення\n"
+    "• /context — показати, що бот пам'ятає (останній контекст)\n"
+    "• /reset — очистити контекст для цього чату\n"
     "• /help — довідка\n\n"
     "У групі бот відповідає, якщо тегнути @бота або почати повідомлення зі слова «бот»."
 )
 
 START_TEXT = (
     "Привіт! Я асистент спільноти Vibe-Coding 🇺🇦\n"
-    "Допомагаю з ідеями, кодом і можу згенерувати ілюстрації.\n"
-    "Спробуй: /about або /img кіт у мультяшному стилі."
+    "Пам'ятаю контекст у межах цього чату (останній діалог), можу допомогти з кодом і генерити ілюстрації.\n"
+    "Команди: /about, /img, /imgtest, /context, /reset, /help."
 )
 
 ABOUT_TEXT = (
     "Я — офіційний асистент української спільноти Vibe-Coding. "
     "Ми практикуємо «вайб-кодинг»: ти формулюєш ідею, а ШІ допомагає зробити результат — від скриптів "
     "та застосунків до відео й аудіо. Я відповідаю українською, даю практичні підказки, "
-    "інколи доброзичливо піджартовую над вічними проблемами девів (типу «працює на моїй машині» 😅), "
-    "і за потреби генерую ілюстрації через /img. Ділимось досвідом і допомагаємо одне одному. "
-    "Сайт спільноти: vibe-coding.com.ua."
+    "інколи доброзичливо піджартовую над вічними проблемами девів, і за потреби генерую ілюстрації через /img. "
+    "Сайт: vibe-coding.com.ua. Щоб стерти поточний контекст: /reset."
 )
 
 # ==== УТИЛІТИ ДЛЯ ЗОБРАЖЕНЬ ====
@@ -99,14 +115,25 @@ def _image_create_url(prompt: str) -> tuple[str, str]:
     logger.info("OpenAI image model used: %s", model_used)
     return resp["data"][0]["url"], model_used
 
-# ==== КОРИСНІ ХЕЛПЕРИ ====
+# ==== ХЕЛПЕРИ ДЛЯ "ХТО ТИ" ====
 ABOUT_PATTERNS = re.compile(
     r"\b(хто\s+ти|хто\s+такий|для\s+чого\s+ти|навіщо\s+ти|що\s+ти\s+робиш|яка\s+твоя\s+роль)\b",
     re.IGNORECASE
 )
-
 def looks_like_about_question(text: str) -> bool:
     return bool(ABOUT_PATTERNS.search((text or "").strip()))
+
+# ==== ЗБІРКА ПРОМПТА З КОНТЕКСТОМ ====
+def build_messages(chat_id: int, user_text: str):
+    """
+    Включає системний промпт + попередню історію цього чату + поточне повідомлення.
+    """
+    history = get_memory(chat_id)
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    # Підрізаємо історію, якщо вона занадто велика — deque вже обмежує maxlen
+    messages.extend(history)
+    messages.append({"role": "user", "content": user_text})
+    return messages
 
 # ==== КОМАНДИ ====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -117,6 +144,28 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def about_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(ABOUT_TEXT)
+
+async def context_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    mem = get_memory(chat_id)
+    if not mem:
+        await update.message.reply_text("Контекст порожній. Починай нову розмову 🙂")
+        return
+    # показуємо останні до 6 пар (12 записів)
+    shown = mem[-12:]
+    preview = []
+    for m in shown:
+        role = "👤" if m["role"] == "user" else "🤖"
+        text = m["content"]
+        if len(text) > 220:
+            text = text[:220] + "…"
+        preview.append(f"{role} {text}")
+    await update.message.reply_text("Поточний контекст:\n\n" + "\n\n".join(preview))
+
+async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    clear_memory(chat_id)
+    await update.message.reply_text("Ок, контекст для цього чату очищено 🧹")
 
 async def imgtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("IMGTEST TRIGGERED by %s", update.effective_user.id)
@@ -144,15 +193,19 @@ async def img_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bio = io.BytesIO(img_bytes); bio.name = "image.png"; bio.seek(0)
         await update.message.reply_photo(bio, caption=f"Готово ✅")
         logger.info("Image OK | model=%s | prompt='%s'", model_used, prompt)
+        # Збережемо сам запит користувача як частину контексту (корисно)
+        remember(update.effective_chat.id, "user", f"[Запит на зображення] {prompt}")
+        remember(update.effective_chat.id, "assistant", "[Надіслано ілюстрацію]")
     except Exception as e:
         logger.exception("Image gen error: %s", e)
         await update.message.reply_text(f"Не вийшло створити зображення 😕\nПомилка: {e}")
 
-# ==== ТЕКСТОВІ ПОВІДОМЛЕННЯ ====
+# ==== ТЕКСТОВІ ПОВІДОМЛЕННЯ (з пам'яттю) ====
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
     text = update.message.text.strip()
+    chat_id = update.effective_chat.id
 
     # В групі відповідаємо тільки якщо тегнули або звернулись "бот ..."
     bot_username = (context.bot.username or "").lower()
@@ -163,22 +216,24 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for e in entities
     )
     starts_with_word = text.lower().startswith("бот")
-    if not (mentioned_bot or starts_with_word):
+    if update.effective_chat.type != "private" and not (mentioned_bot or starts_with_word):
         return
 
-    # Якщо це питання про ідентичність/роль — даємо фіксовану відповідь, без LLM
+    # Фіксований about без LLM
     if looks_like_about_question(text):
         await update.message.reply_text(ABOUT_TEXT)
+        # теж кладемо у пам'ять (корисно для наступних відповідей)
+        remember(chat_id, "user", text)
+        remember(chat_id, "assistant", ABOUT_TEXT)
         return
 
-    # Інакше — звичайна відповідь через LLM
+    # Збираємо повідомлення з урахуванням історії
+    messages = build_messages(chat_id, text)
+
     try:
         completion = openai.ChatCompletion.create(
             model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": text}
-            ],
+            messages=messages,
             temperature=0.4
         )
         reply = completion["choices"][0]["message"]["content"].strip()
@@ -186,6 +241,11 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         usage = completion.get("usage", {})
         logging.info("Chat OK | model=%s | prompt=%s | completion=%s",
                      completion.get("model"), usage.get("prompt_tokens"), usage.get("completion_tokens"))
+
+        # Оновлюємо пам'ять: додаємо останній хід
+        remember(chat_id, "user", text)
+        remember(chat_id, "assistant", reply)
+
     except Exception as e:
         logger.exception("Text gen error: %s", e)
         await update.message.reply_text("Вибач, сталася помилка на стороні ШІ. Спробуй ще раз 🙏")
@@ -206,6 +266,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("about", about_cmd))
+    app.add_handler(CommandHandler("context", context_cmd))
+    app.add_handler(CommandHandler("reset", reset_cmd))
     app.add_handler(CommandHandler("imgtest", imgtest_cmd))
     app.add_handler(CommandHandler("img", img_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
